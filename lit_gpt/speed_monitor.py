@@ -25,8 +25,7 @@ from lightning.pytorch.plugins import (
     XLAPrecisionPlugin,
 )
 from lightning.pytorch.utilities.rank_zero import rank_zero_only as trainer_rank_zero_only
-#TODO torch and cuda upgrade needed
-# from torch.utils.flop_counter import FlopCounterMode
+from torch.utils.flop_counter import FlopCounterMode
 
 from lit_gpt import GPT
 from lit_gpt.utils import num_parameters
@@ -417,10 +416,8 @@ def estimate_flops(model: GPT) -> int:
 
 def measure_flops(model: GPT, x: torch.Tensor) -> int:
     """Measures real FLOPs for HFU"""
-    #TODO torch and cuda upgrade needed
-    # flop_counter = FlopCounterMode(model, display=False)
-    #TODO changed flop_counter
-    flop_counter = None
+    flop_counter = FlopCounterMode(model, display=False)
+
     ctx = nullcontext() if model.training else torch.no_grad()
     with ctx, flop_counter:
         y = model(x)

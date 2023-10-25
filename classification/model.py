@@ -28,7 +28,7 @@ class ClassificationGPT(BaseAdapter, BaseLoRA):
         self.classification_head = nn.Linear(config.n_embd, config.output_size)
     
     def forward(
-        self, idx: torch.Tensor, input_pos: Optional[torch.Tensor] = None, lm_head_chunk_size: int = 0
+        self, idx: torch.Tensor, input_pos: Optional[torch.Tensor] = None
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         T = idx.size(1)
         if self.max_seq_length < T:
@@ -49,10 +49,7 @@ class ClassificationGPT(BaseAdapter, BaseLoRA):
         for block in self.transformer.h:
             x = block(x, cos, sin, mask, input_pos)
         x = self.transformer.ln_f(x)
-        if lm_head_chunk_size > 0:
-            # chunk the lm head logits to reduce the peak memory used by autograd
-            return [self.classification_head(x_i) for x_i in x.split(lm_head_chunk_size, dim=1)]
-        return self.classification_head(x)  # (b, t, output size)
+        return torch.nn.functional.sigmoid(self.classification_head(x[:, -1, :]))  # (b, output size)
     
     def _init_weights(self, module: nn.Module) -> None:
         adapter_or_lora(

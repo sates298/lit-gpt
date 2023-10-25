@@ -1,6 +1,6 @@
 import torch
 import lightning as L
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict, Union
 from lightning.fabric.plugins import BitsandbytesPrecision
 
 from classification.model import ClassificationConfig
@@ -30,15 +30,6 @@ def main_lora_config(name: str, hparams: dict) -> ClassificationConfig:
         to_head=hparams["lora_head"],
     )
     
-def main_adapter_setup_optimizer(fabric, model, optimizer, *args):
-    model, optimizer = fabric.setup(model, optimizer)
-    scheduler = None
-    return model, scheduler, optimizer
-    
-def main_lora_setup_optimizer(fabric, model, optimizer, hparams):
-    optimizer = fabric.setup_optimizers(optimizer)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=hparams["max_iters"] // hparams["batch_size"])
-    return model, scheduler, optimizer
 
 def get_batch(
     fabric: L.Fabric, data: List[Dict], micro_batch_size: int, longest_seq_ix: Optional[int] = None
@@ -49,7 +40,7 @@ def get_batch(
         ix[0] = longest_seq_ix
     
     input_ids = [data[i]["input_ids"].type(torch.int64) for i in ix]
-    labels = [data[i]["labels"].type(torch.int32) for i in ix]
+    labels = [data[i]["labels"].type(torch.float64) for i in ix]
     # this could be `longest_seq_length` to have a fixed size for all batches
     max_len = max(len(s) for s in input_ids)
 
@@ -68,5 +59,7 @@ def get_batch(
     return x, y
 
 
-def classification_metrics(logits, targets):
-    pass
+def cross_entropy(
+    logits: Union[torch.Tensor, List[torch.Tensor]], targets: torch.Tensor
+) -> torch.Tensor:    
+    return torch.nn.functional.cross_entropy(logits, targets)

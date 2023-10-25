@@ -158,8 +158,8 @@ def generate_prompt(example: dict) -> str:
 # 2. Is instruction or response necessary? Problably to fine-tuned (RLHF) models - yes
 # 3. Are listed emotions necessary?
     return (
-        "Below is an instruction that describes a task. "
-        "Write a response that appropriately completes the request.\n\n"
+        "Categorize the following text for the specified user by selecting the most appropriate emotion from the provided list."
+        "Emotions can be subtle or overt, so analyze the text carefully to make an accurate classification.\n\n"
         f"### User ID:\n{example['rater_id']}\n\n"
         f"### Text:\n{example['text']}\n\n"
         "### Emotions:\n" + "\n- ".join(EMOTIONS) + "\n\n"
