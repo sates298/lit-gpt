@@ -1,19 +1,26 @@
 from torchmetrics import Accuracy, F1Score, Recall, Precision
 from typing import Any
+import torch
 
 
 class ClassificationMetrics():
-    def __init__(self, class_num: int) -> None:
+    def __init__(self, class_num: int, device: str | int = "cuda") -> None:
+        self.device = device
         self.class_num = class_num
-        self.accuracy = Accuracy(task="multilabel", num_classes=self.class_num)
-        self.f1score = F1Score(task="multilabel", num_classes=self.class_num, average="macro")
-        self.recall = Recall(task="multilabel", num_classes=self.class_num, average="macro")
-        self.precision = Precision(task="multilabel", num_classes=self.class_num, average="macro")
+        self.accuracy = Accuracy(task="multilabel", num_labels=self.class_num).to(self.device)
+        self.f1score = F1Score(task="multilabel", num_labels=self.class_num, average="macro").to(self.device)
+        self.recall = Recall(task="multilabel", num_labels=self.class_num, average="macro").to(self.device)
+        self.precision = Precision(task="multilabel", num_labels=self.class_num, average="macro").to(self.device)
         
-        self.all = [self.accuracy, self.f1score, self.recall, self.precision]
+        self.all = {
+            "accuracy": self.accuracy,
+            "f1-score": self.f1score,
+            "recall": self.recall,
+            "precision": self.precision
+        }
     
     def for_all_metrics(self, function: Any, *args) -> Any:
-        return [function(metric, *args) for metric in self.all]
+        return {k: function(metric, *args) for k, metric in self.all.items()}
         
     def _single_update(self, metric, preds, targets):
         return metric.update(preds, targets)

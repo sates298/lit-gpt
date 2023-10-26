@@ -32,9 +32,17 @@ def main_lora_config(name: str, hparams: dict) -> ClassificationConfig:
     
 
 def get_batch(
-    fabric: L.Fabric, data: List[Dict], micro_batch_size: int, longest_seq_ix: Optional[int] = None
+    fabric: L.Fabric, data: List[Dict], micro_batch_size: int, longest_seq_ix: Optional[int] = None, first_ix: int = -1
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    ix = torch.randint(len(data), (micro_batch_size,))
+    assert first_ix == -1 or first_ix >= 0
+    if first_ix == -1:
+        ix = torch.randint(len(data), (micro_batch_size,))
+    else:
+        last_ix= first_ix+micro_batch_size 
+        if last_ix > len(data):
+            last_ix = len(data)
+        ix = list(range(first_ix, last_ix))
+        
     if longest_seq_ix is not None:
         # force the longest sample at the beginning so potential OOMs happen right away
         ix[0] = longest_seq_ix

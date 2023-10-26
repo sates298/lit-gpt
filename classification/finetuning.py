@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Literal
 from tqdm import tqdm
+from random import shuffle, seed
 
 import lightning as L
 import torch
@@ -42,6 +43,8 @@ custom_hparams = dict(
     output_size=28,
     with_scheduler=True,
     micro_batch_size=2,
+    devices=1,
+    max_epochs=10
 )
 
 def setup(
@@ -59,9 +62,11 @@ def setup(
     custom_hparams |= kwargs
 
     hparams = adapter_or_lora(model_type, adapter_hparams, lora_hparams)
+    hparams.update(custom_hparams)
     hparams["model_type"] = model_type
     hparams["quantize"] = quantize
-    hparams.update(custom_hparams)
+    hparams["gradient_accumulation_iters"] = hparams["batch_size"] // hparams["micro_batch_size"]
+    assert hparams["gradient_accumulation_iters"] > 0
     
     plugins, precision = adapter_or_lora(model_type, (None, precision), setup_quantization, lora_args={"quantize": quantize, "precision": precision})
     
@@ -100,6 +105,10 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
         os.makedirs(out_dir, exist_ok=True)
 
     train_data = torch.load(data_dir / "train.pt")
+    
+    max_iters_per_epoch = len(train_data) // hparams["batch_size"]
+    hparams["max_iters_per_epoch"] = max_iters_per_epoch
+    
     val_data = torch.load(data_dir / "val.pt")
     test_data = torch.load(data_dir / "test.pt")
 
@@ -137,12 +146,12 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
     model, optimizer = fabric.setup(model, optimizer)
     scheduler = None
     if hparams["with_scheduler"]:
-        scheduler =  torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=hparams["max_iters"] // hparams["batch_size"])
+        scheduler =  torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=(hparams["max_epochs"] * hparams["max_iters_per_epoch"]) // hparams["batch_size"])
     
     fabric.seed_everything(1337 + fabric.global_rank)
 
     train_time = time.perf_counter()
-    train(fabric, model, optimizer, scheduler, train_data, val_data, checkpoint_dir, out_dir, speed_monitor, hparams)
+    train(fabric, model, optimizer, scheduler, train_data, val_data, out_dir, speed_monitor, hparams)
     fabric.print(f"Training time: {(time.perf_counter()-train_time):.2f}s")
     if fabric.device.type == "cuda":
         fabric.print(f"Memory used: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB")
@@ -155,7 +164,7 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
     elif model.model_type == LORA_TYPE:
         save_lora_checkpoint(fabric, model, save_path)
     
-    test(fabric, model, test_data, checkpoint_dir)
+    test(fabric, model, test_data, hparams)
 
 
 def train(
@@ -165,12 +174,12 @@ def train(
     scheduler: torch.optim.lr_scheduler.LRScheduler | None,
     train_data: List[Dict],
     val_data: List[Dict],
-    checkpoint_dir: Path,
     out_dir: Path,
     speed_monitor: SpeedMonitor,
     hparams: dict,
 ) -> None:
-    tokenizer = Tokenizer(checkpoint_dir)
+    train_metric_class = ClassificationMetrics(model.config.output_size)
+    val_metric_class = ClassificationMetrics(model.config.output_size)
     longest_seq_length, longest_seq_ix = get_longest_seq_length(train_data)
     model.max_seq_length = longest_seq_length
     fabric.print(
@@ -178,7 +187,7 @@ def train(
         f" {model.max_seq_length} and context length is {model.config.block_size}"
     )
 
-    validate(fabric, model, val_data, tokenizer, hparams["eval_iters"], hparams["micro_batch_size"], sanity_check=True)  # sanity check
+    validate(fabric, model, val_data, hparams["eval_iters"], hparams["micro_batch_size"], val_metric_class, sanity_check=True)  # sanity check
 
     with torch.device("meta"):
         meta_model = ClassificationGPT(model.config)
@@ -198,94 +207,132 @@ def train(
     step_count = 0
     total_lengths = 0
     total_t0 = time.perf_counter()
+    fabric.print("Training...")
 
-    for iter_num in tqdm(range(hparams["max_iters"]), desc="Training"):
-        if step_count <= hparams["warmup_steps"]:
-            # linear warmup
-            lr = hparams["learning_rate"] * step_count / hparams["warmup_steps"]
-            for param_group in optimizer.param_groups:
-                param_group["lr"] = lr
+    for epoch in range(hparams["max_epochs"]):
+        for iter_num in tqdm(range(hparams["max_iters_per_epoch"]), desc=f"Epoch {epoch}"):
+            if step_count <= hparams["warmup_steps"]:
+                # linear warmup
+                lr = hparams["learning_rate"] * step_count / hparams["warmup_steps"]
+                for param_group in optimizer.param_groups:
+                    param_group["lr"] = lr
 
-        iter_t0 = time.perf_counter()
+            iter_t0 = time.perf_counter()
 
-        input_ids, targets = get_batch(fabric, train_data, hparams["micro_batch_size"], longest_seq_ix if iter_num == 0 else None)
-        
-        is_accumulating = (iter_num + 1) % hparams["gradient_accumulation_iters"] != 0
-        with fabric.no_backward_sync(model, enabled=is_accumulating):
-            logits = model(input_ids)
-            loss = cross_entropy(logits, targets)
-            fabric.backward(loss / hparams["gradient_accumulation_iters"])
-            # TODO add metrics
-            # TODO add logging
+            input_ids, targets = get_batch(fabric, train_data, hparams["micro_batch_size"], longest_seq_ix if iter_num == 0 else None)
             
-        if not is_accumulating:
-            optimizer.step()
-            optimizer.zero_grad()
-            if scheduler is not None and step_count > hparams["warmup_steps"]:
-                scheduler.step()
-            step_count += 1
+            is_accumulating = (iter_num + 1) % hparams["gradient_accumulation_iters"] != 0 or iter_num + 1 == hparams["max_iters_per_epoch"]
+            with fabric.no_backward_sync(model, enabled=is_accumulating):
+                logits = model(input_ids)
+                loss = cross_entropy(logits, targets)
+                train_metric_class.update(logits, targets)
+                fabric.backward(loss / hparams["gradient_accumulation_iters"])
+                
+            if not is_accumulating:
+                optimizer.step()
+                optimizer.zero_grad()
+                if scheduler is not None and step_count > hparams["warmup_steps"]:
+                    scheduler.step()
+                step_count += 1
 
 
-
-        t1 = time.perf_counter()
-        total_lengths += input_ids.size(1)
-        speed_monitor.on_train_batch_end(
-            (iter_num + 1) * hparams["micro_batch_size"],
-            t1 - total_t0,
-            # this assumes that device FLOPs are the same and that all devices have the same batch size
-            fabric.world_size,
-            flops_per_batch=measured_flops,
-            lengths=total_lengths,
-        )
-        # if iter_num % hparams["log_interval"] == 0:
-        #     fabric.print(
-        #         f"iter {iter_num} step {step_count}: loss {loss.item():.4f}, iter time:"
-        #         f" {(t1 - iter_t0) * 1000:.2f}ms{' (optimizer.step)' if not is_accumulating else ''}"
-        #     )
-        if not is_accumulating and step_count % hparams["eval_interval"] == 0:
-            t0 = time.perf_counter()
-            val_loss = validate(fabric, model, val_data, tokenizer, hparams["eval_iters"], hparams["micro_batch_size"])
-            t1 = time.perf_counter() - t0
-            speed_monitor.eval_end(t1)
-            # fabric.print(f"step {iter_num}: val loss {val_loss.item():.4f}, val time: {t1 * 1000:.2f}ms")
-            fabric.barrier()
-        if not is_accumulating and step_count % hparams["save_interval"] == 0:
-            checkpoint_path = out_dir / f"iter-{iter_num:06d}-ckpt.pth"
-            adapter_or_lora(
-                model.model_type,
-                save_adapter_checkpoint,
-                save_lora_checkpoint
-            )(fabric, model, checkpoint_path)
+            t1 = time.perf_counter()
+            total_lengths += input_ids.size(1)
+            speed_monitor.on_train_batch_end(
+                (epoch*hparams["max_iters_per_epoch"] + (iter_num + 1)) * hparams["micro_batch_size"],
+                t1 - total_t0,
+                # this assumes that device FLOPs are the same and that all devices have the same batch size
+                fabric.world_size,
+                flops_per_batch=measured_flops,
+                lengths=total_lengths,
+            )
+            # if iter_num % hparams["log_interval"] == 0:
+            #     fabric.print(
+            #         f"iter {iter_num} step {step_count}: loss {loss.item():.4f}, iter time:"
+            #         f" {(t1 - iter_t0) * 1000:.2f}ms{' (optimizer.step)' if not is_accumulating else ''}"
+            #     )
+            if not is_accumulating and step_count % hparams["eval_interval"] == 0:
+                train_metrics = train_metric_class.compute()
+                train_metric_class.reset()
+                train_metrics["mode"] = "train"
+                fabric.log_dict(train_metrics, step=step_count)
+                
+                t0 = time.perf_counter()
+                val_loss = validate(fabric, model, val_data,
+                                    hparams["eval_iters"], hparams["micro_batch_size"],
+                                    val_metric_class)
+                t1 = time.perf_counter() - t0
+                speed_monitor.eval_end(t1)
+                # fabric.print(f"step {iter_num}: val loss {val_loss.item():.4f}, val time: {t1 * 1000:.2f}ms")
+                fabric.barrier()
+            if not is_accumulating and step_count % hparams["save_interval"] == 0:
+                num_ckpt = iter_num + epoch*hparams["max_iters_per_epoch"]
+                checkpoint_path = out_dir / f"iter-{num_ckpt:06d}-ckpt.pth"
+                adapter_or_lora(
+                    model.model_type,
+                    save_adapter_checkpoint,
+                    save_lora_checkpoint
+                )(fabric, model, checkpoint_path)
                 
 
 # the adapter "kv cache" cannot be initialized under `inference_mode`
 @torch.no_grad()
 def validate(fabric: L.Fabric, model: ClassificationGPT, 
-             val_data: List[Dict], tokenizer: Tokenizer,
+             val_data: List[Dict],
              eval_iters: int,
              micro_batch_size: int,
+             metric_class: ClassificationMetrics,
              sanity_check: bool = False) -> torch.Tensor:
     fabric.print("Validating ...")
     model.eval()
+    assert eval_iters <= len(val_data)//micro_batch_size
+    
     losses = torch.zeros(eval_iters)
+    
+    seed(1337)
+    shuffle(val_data)
+    
     for k in tqdm(range(eval_iters)):
-        input_ids, targets = get_batch(fabric, val_data, micro_batch_size=micro_batch_size)
+        first_ix = k*micro_batch_size
+        input_ids, targets = get_batch(fabric, val_data, micro_batch_size=micro_batch_size, first_ix=first_ix)
         logits = model(input_ids)
         losses[k] = cross_entropy(logits, targets)
         if not sanity_check:
-            # TODO add metrices
-            # TODO add logging
-            pass
+            metric_class.update(logits, targets)
+
     val_loss = losses.mean()
+    
+    if not sanity_check:
+        val_metrics = metric_class.compute()
+        metric_class.reset()
+        val_metrics["mode"] = "val"
+        val_metrics["loss"] = val_loss
+        fabric.log_dict(val_metrics)   
 
     model.train()
     return val_loss
 
 @torch.no_grad()
-def test(fabric: L.Fabric, model: ClassificationGPT, val_data: List[Dict], checkpoint_dir: Path):
-    tokenizer = Tokenizer(checkpoint_dir)
+def test(fabric: L.Fabric, model: ClassificationGPT, test_data: List[Dict],  hparams: Dict):
     fabric.print("Testing ...")
     model.eval()
+    
+    metric_class = ClassificationMetrics(model.config.output_size)
+
+    
+    for k in tqdm(range(len(0, test_data, hparams["micro_batch_size"]))):
+        input_ids, targets = get_batch(fabric, test_data, micro_batch_size=hparams["micro_batch_size"], first_ix=k)
+        logits = model(input_ids)
+        metric_class.update(logits, targets)
+
+    test_metrics = metric_class.compute()
+    metric_class.reset()
+    test_metrics["mode"] = "test"
+    test_metrics["loss"] = None
+    fabric.log_dict(test_metrics)   
+
+    model.train()
+    
     
 
 if __name__ == "__main__":
