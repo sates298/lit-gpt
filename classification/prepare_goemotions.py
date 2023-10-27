@@ -33,6 +33,7 @@ def prepare(
     mask_inputs: bool = False,
     ignore_index: int = -1,
     max_seq_length: Optional[int] = None,
+    personalized: bool = True
 ) -> None:
     """Prepare a CSV dataset for instruction tuning.
 
@@ -82,6 +83,7 @@ def prepare(
             max_length=max_seq_length,
             mask_inputs=mask_inputs,
             ignore_index=ignore_index,
+            personalized=personalized
         )
         for sample in tqdm(train_data)
     ]
@@ -95,6 +97,7 @@ def prepare(
             max_length=max_seq_length,
             mask_inputs=mask_inputs,
             ignore_index=ignore_index,
+            personalized=personalized
         )
         for sample in tqdm(val_data)
     ]
@@ -108,13 +111,14 @@ def prepare(
             max_length=max_seq_length,
             mask_inputs=mask_inputs,
             ignore_index=ignore_index,
+            personalized=personalized
         )
         for sample in tqdm(test_data)
     ]
     torch.save(test_set, destination_path / "test.pt")
     
 
-def prepare_sample(example: dict, tokenizer: Tokenizer, max_length: int, mask_inputs: bool, ignore_index: int) -> dict:
+def prepare_sample(example: dict, tokenizer: Tokenizer, max_length: int, mask_inputs: bool, ignore_index: int, personalized: bool = True) -> dict:
     """Processes a single sample.
 
     Each sample in the dataset consists of:
@@ -132,7 +136,7 @@ def prepare_sample(example: dict, tokenizer: Tokenizer, max_length: int, mask_in
     in the label that correspond to the original input prompt get masked out (default).
     """
     
-    full_prompt = generate_prompt(example)
+    full_prompt = generate_prompt(example, personalized)
     # full_prompt_and_response = full_prompt + example["output"]
     encoded_full_prompt = tokenizer.encode(full_prompt, max_length=max_length)
     # encoded_full_prompt_and_response = tokenizer.encode(full_prompt_and_response, eos=True, max_length=max_length)
@@ -149,7 +153,7 @@ def prepare_sample(example: dict, tokenizer: Tokenizer, max_length: int, mask_in
     }
 
 
-def generate_prompt(example: dict) -> str:
+def generate_prompt(example: dict, personalized: bool) -> str:
     """Generates a standardized message to prompt the model with an instruction, optional input and a
     'response' field."""
 
@@ -157,15 +161,23 @@ def generate_prompt(example: dict) -> str:
 # 1. change instruction
 # 2. Is instruction or response necessary? Problably to fine-tuned (RLHF) models - yes
 # 3. Are listed emotions necessary?
-    return (
-        "Categorize the following text for the specified user by selecting the most appropriate emotion from the provided list."
-        "Emotions can be subtle or overt, so analyze the text carefully to make an accurate classification.\n\n"
-        f"### User ID:\n{example['rater_id']}\n\n"
-        f"### Text:\n{example['text']}\n\n"
-        "### Emotions:\n" + "\n- ".join(EMOTIONS) + "\n\n"
-        "### Response:"
-    )
-
+    if personalized:
+        return (
+            "Categorize the following text for the specified user by selecting the most appropriate emotion from the provided list."
+            "Emotions can be subtle or overt, so analyze the text carefully to make an accurate classification.\n\n"
+            f"### User ID:\n{example['rater_id']}\n\n"
+            f"### Text:\n{example['text']}\n\n"
+            "### Emotions:\n" + "\n- ".join(EMOTIONS) + "\n\n"
+            "### Response:"
+        )
+    else:
+        return (
+            "Categorize the following text by selecting the most appropriate emotion from the provided list."
+            "Emotions can be subtle or overt, so analyze the text carefully to make an accurate classification.\n\n"
+            f"### Text:\n{example['text']}\n\n"
+            "### Emotions:\n" + "\n- ".join(EMOTIONS) + "\n\n"
+            "### Response:"
+        )
 
 if __name__ == "__main__":
     from jsonargparse import CLI

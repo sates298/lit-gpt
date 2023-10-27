@@ -4,7 +4,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Literal
 from tqdm import tqdm
-from random import shuffle, seed
+from torch.utils.data import DataLoader
 
 import lightning as L
 import torch
@@ -19,19 +19,17 @@ sys.path.append(str(wd))
 
 # from generate.base import generate
 from classification.metrics import ClassificationMetrics
-from classification.helpers import setup_quantization, main_lora_config,\
-    get_batch, cross_entropy
+from classification.dataloader import PaddingBatcher
+from classification.helpers import setup_quantization, main_lora_config
 from classification.model import ClassificationGPT, ClassificationConfig,\
     mark_trainable, ADAPTER_TYPE, LORA_TYPE, adapter_or_lora
-from finetune.full import get_longest_seq_length
-from finetune.adapter import save_adapter_checkpoint, hparams as adapter_hparams
-from finetune.lora import save_lora_checkpoint, hparams as lora_hparams
+from classification.training import train, valid_test
+
+from finetune.adapter import hparams as adapter_hparams
+from finetune.lora import hparams as lora_hparams
 from lit_gpt.adapter import Block as AdapterBlock
 from lit_gpt.lora import Block as LoRABlock 
-# from lit_gpt.adapter import GPT, Block, Config, adapter_filter, mark_only_adapter_as_trainable
-from lit_gpt.speed_monitor import SpeedMonitorFabric as SpeedMonitor
-from lit_gpt.speed_monitor import estimate_flops, measure_flops
-from lit_gpt.tokenizer import Tokenizer
+
 from lit_gpt.utils import (
     check_valid_checkpoint_dir,
     get_default_supported_precision,
@@ -42,9 +40,12 @@ from lit_gpt.utils import (
 custom_hparams = dict(
     output_size=28,
     with_scheduler=True,
-    micro_batch_size=2,
+    batch_size=128,
+    micro_batch_size=8, # needs to be a divisor of the batch_size
     devices=1,
-    max_epochs=10
+    max_epochs=10,
+    patience= 3,
+    epsilon=0.01
 )
 
 def setup(
@@ -97,18 +98,12 @@ def setup(
 def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, hparams: dict) -> None:
     check_valid_checkpoint_dir(checkpoint_dir)
 
-    speed_monitor = SpeedMonitor(fabric, window_size=50, time_unit="seconds")
-
     fabric.seed_everything(1337)  # same seed for every process to init model (FSDP)
 
     if fabric.global_rank == 0:
         os.makedirs(out_dir, exist_ok=True)
 
     train_data = torch.load(data_dir / "train.pt")
-    
-    max_iters_per_epoch = len(train_data) // hparams["batch_size"]
-    hparams["max_iters_per_epoch"] = max_iters_per_epoch
-    
     val_data = torch.load(data_dir / "val.pt")
     test_data = torch.load(data_dir / "test.pt")
 
@@ -138,7 +133,6 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
 
     if isinstance(fabric.strategy.precision, BitsandbytesPrecision):
         import bitsandbytes as bnb
-
         optimizer = bnb.optim.PagedAdamW(trainable_params, lr=hparams["learning_rate"], weight_decay=hparams["weight_decay"])
     else:
         optimizer = torch.optim.AdamW(trainable_params, lr=hparams["learning_rate"], weight_decay=hparams["weight_decay"])
@@ -146,194 +140,21 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
     model, optimizer = fabric.setup(model, optimizer)
     scheduler = None
     if hparams["with_scheduler"]:
-        scheduler =  torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=(hparams["max_epochs"] * hparams["max_iters_per_epoch"]) // hparams["batch_size"])
+        T_max = (hparams["max_epochs"] * len(train_data)) // (hparams["batch_size"]*hparams["micro_batch_size"])
+        scheduler =  torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=T_max)
     
     fabric.seed_everything(1337 + fabric.global_rank)
 
-    train_time = time.perf_counter()
-    train(fabric, model, optimizer, scheduler, train_data, val_data, out_dir, speed_monitor, hparams)
-    fabric.print(f"Training time: {(time.perf_counter()-train_time):.2f}s")
+    train(fabric, model, optimizer, scheduler, train_data, val_data, out_dir, hparams)
+    
     if fabric.device.type == "cuda":
         fabric.print(f"Memory used: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB")
-
-    # Save the final checkpoint at the end of training
-    save_path = out_dir / f"lit_model_{model.model_type}_finetuned.pth"
     
-    if model.model_type == ADAPTER_TYPE:
-        save_adapter_checkpoint(fabric, model, save_path)
-    elif model.model_type == LORA_TYPE:
-        save_lora_checkpoint(fabric, model, save_path)
-    
-    test(fabric, model, test_data, hparams)
+    test_loader = PaddingBatcher(fabric, test_data, hparams["micro_batch_size"]).dataloader()
+    valid_test(fabric, model, test_loader, ClassificationMetrics(model.config.output_size), mode="test")
 
 
-def train(
-    fabric: L.Fabric,
-    model: ClassificationGPT,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler | None,
-    train_data: List[Dict],
-    val_data: List[Dict],
-    out_dir: Path,
-    speed_monitor: SpeedMonitor,
-    hparams: dict,
-) -> None:
-    train_metric_class = ClassificationMetrics(model.config.output_size)
-    val_metric_class = ClassificationMetrics(model.config.output_size)
-    longest_seq_length, longest_seq_ix = get_longest_seq_length(train_data)
-    model.max_seq_length = longest_seq_length
-    fabric.print(
-        f"The longest sequence length in the train data is {longest_seq_length}, the model's maximum sequence length is"
-        f" {model.max_seq_length} and context length is {model.config.block_size}"
-    )
 
-    validate(fabric, model, val_data, hparams["eval_iters"], hparams["micro_batch_size"], val_metric_class, sanity_check=True)  # sanity check
-
-    with torch.device("meta"):
-        meta_model = ClassificationGPT(model.config)
-        mark_trainable(meta_model)
-        # "estimated" is not as precise as "measured". Estimated is optimistic but widely used in the wild.
-        # When comparing MFU or FLOP numbers with other projects that use estimated FLOPs,
-        # consider passing `SpeedMonitor(flops_per_batch=estimated_flops)` instead
-        estimated_flops = estimate_flops(meta_model) * hparams["micro_batch_size"]
-        fabric.print(f"Estimated TFLOPs: {estimated_flops * fabric.world_size / 1e12:.2f}")
-        # this assumes that all samples have a fixed length equal to the longest sequence length
-        # which is most likely false during finetuning
-        x = torch.randint(0, 1, (hparams["micro_batch_size"], longest_seq_length))
-        measured_flops = measure_flops(meta_model, x)
-        fabric.print(f"Measured TFLOPs: {measured_flops * fabric.world_size / 1e12:.2f}")
-        del meta_model, x
-
-    step_count = 0
-    total_lengths = 0
-    total_t0 = time.perf_counter()
-    fabric.print("Training...")
-
-    for epoch in range(hparams["max_epochs"]):
-        for iter_num in tqdm(range(hparams["max_iters_per_epoch"]), desc=f"Epoch {epoch}"):
-            if step_count <= hparams["warmup_steps"]:
-                # linear warmup
-                lr = hparams["learning_rate"] * step_count / hparams["warmup_steps"]
-                for param_group in optimizer.param_groups:
-                    param_group["lr"] = lr
-
-            iter_t0 = time.perf_counter()
-
-            input_ids, targets = get_batch(fabric, train_data, hparams["micro_batch_size"], longest_seq_ix if iter_num == 0 else None)
-            
-            is_accumulating = (iter_num + 1) % hparams["gradient_accumulation_iters"] != 0 or iter_num + 1 == hparams["max_iters_per_epoch"]
-            with fabric.no_backward_sync(model, enabled=is_accumulating):
-                logits = model(input_ids)
-                loss = cross_entropy(logits, targets)
-                train_metric_class.update(logits, targets)
-                fabric.backward(loss / hparams["gradient_accumulation_iters"])
-                
-            if not is_accumulating:
-                optimizer.step()
-                optimizer.zero_grad()
-                if scheduler is not None and step_count > hparams["warmup_steps"]:
-                    scheduler.step()
-                step_count += 1
-
-
-            t1 = time.perf_counter()
-            total_lengths += input_ids.size(1)
-            speed_monitor.on_train_batch_end(
-                (epoch*hparams["max_iters_per_epoch"] + (iter_num + 1)) * hparams["micro_batch_size"],
-                t1 - total_t0,
-                # this assumes that device FLOPs are the same and that all devices have the same batch size
-                fabric.world_size,
-                flops_per_batch=measured_flops,
-                lengths=total_lengths,
-            )
-            # if iter_num % hparams["log_interval"] == 0:
-            #     fabric.print(
-            #         f"iter {iter_num} step {step_count}: loss {loss.item():.4f}, iter time:"
-            #         f" {(t1 - iter_t0) * 1000:.2f}ms{' (optimizer.step)' if not is_accumulating else ''}"
-            #     )
-            if not is_accumulating and step_count % hparams["eval_interval"] == 0:
-                train_metrics = train_metric_class.compute()
-                train_metric_class.reset()
-                train_metrics["mode"] = "train"
-                fabric.log_dict(train_metrics, step=step_count)
-                
-                t0 = time.perf_counter()
-                val_loss = validate(fabric, model, val_data,
-                                    hparams["eval_iters"], hparams["micro_batch_size"],
-                                    val_metric_class)
-                t1 = time.perf_counter() - t0
-                speed_monitor.eval_end(t1)
-                # fabric.print(f"step {iter_num}: val loss {val_loss.item():.4f}, val time: {t1 * 1000:.2f}ms")
-                fabric.barrier()
-            if not is_accumulating and step_count % hparams["save_interval"] == 0:
-                num_ckpt = iter_num + epoch*hparams["max_iters_per_epoch"]
-                checkpoint_path = out_dir / f"iter-{num_ckpt:06d}-ckpt.pth"
-                adapter_or_lora(
-                    model.model_type,
-                    save_adapter_checkpoint,
-                    save_lora_checkpoint
-                )(fabric, model, checkpoint_path)
-                
-
-# the adapter "kv cache" cannot be initialized under `inference_mode`
-@torch.no_grad()
-def validate(fabric: L.Fabric, model: ClassificationGPT, 
-             val_data: List[Dict],
-             eval_iters: int,
-             micro_batch_size: int,
-             metric_class: ClassificationMetrics,
-             sanity_check: bool = False) -> torch.Tensor:
-    fabric.print("Validating ...")
-    model.eval()
-    assert eval_iters <= len(val_data)//micro_batch_size
-    
-    losses = torch.zeros(eval_iters)
-    
-    seed(1337)
-    shuffle(val_data)
-    
-    for k in tqdm(range(eval_iters)):
-        first_ix = k*micro_batch_size
-        input_ids, targets = get_batch(fabric, val_data, micro_batch_size=micro_batch_size, first_ix=first_ix)
-        logits = model(input_ids)
-        losses[k] = cross_entropy(logits, targets)
-        if not sanity_check:
-            metric_class.update(logits, targets)
-
-    val_loss = losses.mean()
-    
-    if not sanity_check:
-        val_metrics = metric_class.compute()
-        metric_class.reset()
-        val_metrics["mode"] = "val"
-        val_metrics["loss"] = val_loss
-        fabric.log_dict(val_metrics)   
-
-    model.train()
-    return val_loss
-
-@torch.no_grad()
-def test(fabric: L.Fabric, model: ClassificationGPT, test_data: List[Dict],  hparams: Dict):
-    fabric.print("Testing ...")
-    model.eval()
-    
-    metric_class = ClassificationMetrics(model.config.output_size)
-
-    
-    for k in tqdm(range(len(0, test_data, hparams["micro_batch_size"]))):
-        input_ids, targets = get_batch(fabric, test_data, micro_batch_size=hparams["micro_batch_size"], first_ix=k)
-        logits = model(input_ids)
-        metric_class.update(logits, targets)
-
-    test_metrics = metric_class.compute()
-    metric_class.reset()
-    test_metrics["mode"] = "test"
-    test_metrics["loss"] = None
-    fabric.log_dict(test_metrics)   
-
-    model.train()
-    
-    
 
 if __name__ == "__main__":
     # Uncomment this line if you see an error: "Expected is_sm80 to be true, but got false"
